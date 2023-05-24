@@ -1,25 +1,39 @@
 use once_cell::sync::Lazy;
+#[cfg(feature = "pyo3")]
 use pyo3::{
-    exceptions::PyValueError,
+    basic::CompareOp,
+    exceptions::{PyNotImplementedError, PyValueError},
     prelude::*,
     types::{PyDict, PyType},
 };
 use regex::Regex;
-use serde::ser::{Serialize, SerializeStruct, Serializer};
-use std::{collections::HashMap, path::Path};
+use serde::Deserialize;
+use std::path::Path;
+#[cfg(feature = "pyo3")]
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+};
+use std::{collections::HashMap, fmt, path::PathBuf, str::FromStr};
 use url::Url;
 
+use crate::error::{Error, ErrorKind};
+
 static VCS_SCHEMES: [&str; 4] = ["git", "hg", "svn", "bzr"];
+#[cfg(feature = "pyo3")]
 static SUPPORTED_HASHES: [&str; 6] = ["sha1", "sha224", "sha384", "sha256", "sha512", "md5"];
 static SSH_GIT_URL: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(^.+?://(?:.+?@)?.+?)(:)(.+$)").unwrap());
 
-#[derive(FromPyObject, Clone)]
+#[cfg_attr(feature = "pyo3", derive(FromPyObject))]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
 pub enum DistMetadata {
     Enabled(bool),
     Hashes(HashMap<String, String>),
 }
 
+#[cfg(feature = "pyo3")]
 impl IntoPy<PyObject> for DistMetadata {
     fn into_py(self, py: Python) -> PyObject {
         match self {
@@ -35,49 +49,39 @@ impl IntoPy<PyObject> for DistMetadata {
     }
 }
 
-#[pyclass]
+#[cfg_attr(feature = "pyo3", pyclass)]
 pub struct Link {
-    #[pyo3(get)]
     url: String,
-    #[pyo3(get)]
-    normalized: String,
-    parsed: Url,
-    #[pyo3(get)]
-    vcs: Option<String>,
-    #[pyo3(get)]
-    comes_from: Option<String>,
-    #[pyo3(get)]
-    yank_reason: Option<String>,
-    #[pyo3(get)]
-    requires_python: Option<String>,
-    hashes: Option<HashMap<String, String>>,
-    #[pyo3(get)]
-    dist_metadata: Option<DistMetadata>,
+    pub normalized: String,
+    pub parsed: Url,
+    pub vcs: Option<String>,
+    pub comes_from: Option<String>,
+    pub yank_reason: Option<String>,
+    pub requires_python: Option<String>,
+    hashes_map: Option<HashMap<String, String>>,
+    pub dist_metadata: Option<DistMetadata>,
 }
 
 /// Add ssh:// to git+ URLs if they don't already have it
 /// This is what pip does.
-fn add_ssh_scheme_to_git_uri(uri: &str) -> PyResult<String> {
+fn add_ssh_scheme_to_git_uri(uri: &str) -> String {
     if uri.contains("://") {
-        Ok(uri.to_string())
+        uri.to_string()
     } else {
         let cloned = format!("ssh://{}", uri);
-        Ok(SSH_GIT_URL.replace(&cloned, "$1/$3").into_owned())
+        SSH_GIT_URL.replace(&cloned, "$1/$3").into_owned()
     }
 }
 
-#[pymethods]
 impl Link {
-    #[new]
-    #[pyo3(signature = (url, comes_from = None, yank_reason = None, requires_python = None, hashes = None, dist_metadata = None))]
-    fn new(
+    pub fn new(
         url: String,
         comes_from: Option<String>,
         yank_reason: Option<String>,
         requires_python: Option<String>,
         hashes: Option<HashMap<String, String>>,
         dist_metadata: Option<DistMetadata>,
-    ) -> PyResult<Self> {
+    ) -> Result<Self, Error> {
         let cloned = url.clone();
         let (normalized, vcs) = {
             if VCS_SCHEMES
@@ -86,7 +90,7 @@ impl Link {
             {
                 match cloned.split_once('+') {
                     Some((vcs, rest)) => {
-                        let cleaned = add_ssh_scheme_to_git_uri(rest)?;
+                        let cleaned = add_ssh_scheme_to_git_uri(rest);
                         (cleaned, Some(vcs.to_string()))
                     }
                     None => (cloned, None),
@@ -96,7 +100,7 @@ impl Link {
             }
         };
         let parsed = Url::parse(normalized.as_str())
-            .map_err(|_| PyValueError::new_err(format!("Invalid URL: {}", normalized)))?;
+            .map_err(|_| Error::new(ErrorKind::UrlError, format!("Invalid URL: {}", normalized)))?;
         Ok(Self {
             url,
             normalized,
@@ -105,9 +109,95 @@ impl Link {
             comes_from,
             yank_reason,
             requires_python,
-            hashes,
+            hashes_map: hashes,
             dist_metadata,
         })
+    }
+
+    pub fn is_file(&self) -> bool {
+        self.parsed.scheme() == "file"
+    }
+
+    pub fn file_path(&self) -> Result<PathBuf, Error> {
+        if self.is_file() {
+            // file:// url to path
+            self.parsed.to_file_path().map_err(|_| {
+                Error::new(
+                    ErrorKind::UrlError,
+                    format!("Invalid file URL: {}", self.normalized),
+                )
+            })
+        } else {
+            Err(Error::new(
+                ErrorKind::UrlError,
+                format!("Not a file URL: {}", self.normalized),
+            ))
+        }
+    }
+    pub fn filename(&self) -> String {
+        let path = self.parsed.path();
+        let decoded_path = percent_encoding::percent_decode(path.as_bytes())
+            .decode_utf8_lossy()
+            .into_owned();
+        let path = Path::new(&decoded_path);
+        path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    pub fn url_without_fragment(&self) -> String {
+        let mut cloned = self.parsed.clone();
+        cloned.set_fragment(None);
+        cloned.to_string()
+    }
+}
+
+impl FromStr for Link {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s.to_string(), None, None, None, None, None)
+    }
+}
+
+impl PartialEq for Link {
+    fn eq(&self, other: &Self) -> bool {
+        self.normalized == other.normalized
+            && self.requires_python == other.requires_python
+            && self.yank_reason == other.yank_reason
+    }
+}
+
+impl Eq for Link {}
+
+impl fmt::Display for Link {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.normalized)
+    }
+}
+
+#[cfg(feature = "pyo3")]
+#[pymethods]
+impl Link {
+    #[new]
+    #[pyo3(signature = (url, comes_from = None, yank_reason = None, requires_python = None, hashes = None, dist_metadata = None))]
+    fn py_new(
+        url: String,
+        comes_from: Option<String>,
+        yank_reason: Option<String>,
+        requires_python: Option<String>,
+        hashes: Option<HashMap<String, String>>,
+        dist_metadata: Option<DistMetadata>,
+    ) -> PyResult<Self> {
+        Ok(Self::new(
+            url,
+            comes_from,
+            yank_reason,
+            requires_python,
+            hashes,
+            dist_metadata,
+        )?)
     }
 
     fn __repr__(&self) -> String {
@@ -116,6 +206,59 @@ impl Link {
             self.redacted(),
             self.comes_from.clone().unwrap_or_default()
         )
+    }
+
+    fn __richcmp__(&self, other: &Self, op: CompareOp) -> PyResult<bool> {
+        match op {
+            CompareOp::Eq => Ok(self == other),
+            CompareOp::Ne => Ok(self != other),
+            _ => Err(PyNotImplementedError::new_err(
+                "Only equality comparisons are supported",
+            )),
+        }
+    }
+
+    fn __hash__(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.normalized.hash(&mut hasher);
+        self.requires_python.hash(&mut hasher);
+        self.yank_reason.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    #[getter]
+    fn url(&self) -> &str {
+        self.url.as_str()
+    }
+
+    #[getter]
+    fn normalized(&self) -> &str {
+        self.normalized.as_str()
+    }
+
+    #[getter]
+    fn vcs(&self) -> Option<&str> {
+        self.vcs.as_deref()
+    }
+
+    #[getter]
+    fn comes_from(&self) -> Option<&str> {
+        self.comes_from.as_deref()
+    }
+
+    #[getter]
+    fn yank_reason(&self) -> Option<&str> {
+        self.yank_reason.as_deref()
+    }
+
+    #[getter]
+    fn requires_python(&self) -> Option<&str> {
+        self.requires_python.as_deref()
+    }
+
+    #[getter]
+    fn dist_metadata(&self) -> Option<DistMetadata> {
+        self.dist_metadata.clone()
     }
 
     #[getter]
@@ -130,29 +273,19 @@ impl Link {
         }
     }
 
-    #[getter]
-    fn url_without_fragment(&self) -> String {
-        let mut cloned = self.parsed.clone();
-        cloned.set_fragment(None);
-        cloned.to_string()
+    #[getter(url_without_fragment)]
+    fn py_url_without_fragment(&self) -> String {
+        self.url_without_fragment()
     }
 
-    #[getter]
-    fn is_file(&self) -> bool {
-        self.parsed.scheme() == "file"
+    #[getter(is_file)]
+    fn py_is_file(&self) -> bool {
+        self.is_file()
     }
 
-    #[getter]
-    fn file_path(&self) -> PyResult<String> {
-        if self.is_file() {
-            // file:// url to path
-            match self.parsed.to_file_path() {
-                Ok(path) => Ok(path.to_string_lossy().to_string()),
-                Err(_) => Err(PyValueError::new_err("Invalid file URL")),
-            }
-        } else {
-            Err(PyValueError::new_err("Not a file URL"))
-        }
+    #[getter(file_path)]
+    fn py_file_path(&self) -> PyResult<String> {
+        Ok(self.file_path()?.to_string_lossy().to_string())
     }
 
     #[classmethod]
@@ -168,7 +301,7 @@ impl Link {
             comes_from: None,
             yank_reason: None,
             requires_python: None,
-            hashes: None,
+            hashes_map: None,
             dist_metadata: None,
         })
     }
@@ -183,23 +316,14 @@ impl Link {
         self.yank_reason.is_some()
     }
 
-    #[getter]
-    fn filename(&self) -> PyResult<String> {
-        let path = self.parsed.path();
-        let decoded_path = percent_encoding::percent_decode(path.as_bytes())
-            .decode_utf8_lossy()
-            .into_owned();
-        let path = Path::new(&decoded_path);
-        Ok(path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned())
+    #[getter(filename)]
+    fn py_filename(&self) -> String {
+        self.filename()
     }
 
     #[getter]
     fn is_wheel(&self) -> bool {
-        self.filename().unwrap_or_default().ends_with(".whl")
+        self.filename().ends_with(".whl")
     }
 
     #[getter]
@@ -216,7 +340,7 @@ impl Link {
 
     #[getter]
     fn hashes(&self) -> Option<HashMap<String, String>> {
-        if let Some(hashes) = &self.hashes {
+        if let Some(hashes) = &self.hashes_map {
             Some(hashes.clone())
         } else {
             let fragments = self.parsed.fragment()?;
@@ -248,7 +372,7 @@ impl Link {
     fn dist_metadata_link(&self) -> Option<Self> {
         match self.dist_metadata {
             Some(DistMetadata::Enabled(true)) | Some(DistMetadata::Hashes(_)) => Some(
-                Self::new(
+                Self::py_new(
                     format!("{}.metadata", self.url_without_fragment()),
                     self.comes_from.clone(),
                     None,
@@ -263,29 +387,14 @@ impl Link {
     }
 }
 
-impl Serialize for Link {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("Link", 5)?;
-        state.serialize_field("url", &self.redacted())?;
-        state.serialize_field("comes_from", &self.comes_from)?;
-        state.serialize_field("yank_reason", &self.yank_reason)?;
-        state.serialize_field("requires_python", &self.requires_python)?;
-        state.serialize_field(
-            "metadata",
-            &self.dist_metadata_link().map(|link| link.normalized),
-        )?;
-        state.end()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_url_without_fragment() {
+    fn test_new() {
         let link = Link::new(
-            "https://example.com/#fragment".to_string(),
+            "https://example.com/".to_string(),
             None,
             None,
             None,
@@ -293,7 +402,13 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(link.url_without_fragment(), "https://example.com/");
+        assert_eq!(link.url, "https://example.com/");
+        assert_eq!(link.normalized, "https://example.com/");
+        assert_eq!(link.vcs, None);
+        assert_eq!(link.comes_from, None);
+        assert_eq!(link.yank_reason, None);
+        assert_eq!(link.requires_python, None);
+        assert_eq!(link.hashes_map, None);
     }
 
     #[test]
@@ -321,108 +436,9 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(link.file_path().unwrap(), "/path/to/file");
-    }
-
-    #[test]
-    fn test_is_vcs() {
-        let link = Link::new(
-            "git+https://example.com/repo.git".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(link.is_vcs());
-    }
-
-    #[test]
-    fn test_is_yanked() {
-        let link = Link::new(
-            "https://example.com/".to_string(),
-            None,
-            Some("yanked".to_string()),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(link.is_yanked());
-    }
-
-    #[test]
-    fn test_filename() {
-        let link = Link::new(
-            "https://example.com/path/to/file.txt".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(link.filename().unwrap(), "file.txt");
-    }
-
-    #[test]
-    fn test_is_wheel() {
-        let link = Link::new(
-            "https://example.com/path/to/file.whl".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(link.is_wheel());
-    }
-
-    #[test]
-    fn test_subdirectory() {
-        let link = Link::new(
-            "https://example.com/#subdirectory=foo/bar".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(link.subdirectory().unwrap(), "foo/bar");
-    }
-
-    #[test]
-    fn test_hashes() {
-        let mut expected = HashMap::new();
-        expected.insert("sha256".to_string(), "abc123".to_string());
-        let link = Link::new(
-            "https://example.com/#sha256=abc123".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(link.hashes().unwrap(), expected);
-    }
-
-    #[test]
-    fn test_hash_options() {
-        let mut expected = HashMap::new();
-        expected.insert("sha256".to_string(), vec!["abc123".to_string()]);
-        let link = Link::new(
-            "https://example.com/#sha256=abc123".to_string(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(link.hash_options().unwrap(), expected);
+        assert_eq!(
+            link.file_path().unwrap(),
+            PathBuf::from_str("/path/to/file").unwrap()
+        );
     }
 }

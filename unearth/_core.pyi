@@ -1,4 +1,11 @@
 class Link:
+    url: str
+    normalized: str
+    comes_from: str | None
+    yank_reason: str | None
+    requires_python: str | None
+    dist_metadata: dict[str, str] | bool | None
+
     def __init__(
         self,
         url: str,
@@ -8,6 +15,8 @@ class Link:
         hashes: dict[str, str] | None,
         dist_metadata: dict[str, str] | bool | None,
     ) -> None: ...
+    def __eq__(self, __value: object) -> bool: ...
+    def __hash__(self) -> int: ...
     @property
     def url_without_fragment(self) -> str: ...
     @property
