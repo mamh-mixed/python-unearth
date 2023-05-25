@@ -43,3 +43,19 @@ class Link:
     def hash_options(self) -> dict[str, list[str]] | None: ...
     @property
     def dist_metadata_link(self) -> Link | None: ...
+
+class Tag:
+    interpreter: str
+    abi: str
+    platform: str
+
+class TargetPython:
+    def __init__(
+        self,
+        py_ver: tuple[int, int] | None,
+        abis: list[str] | None,
+        implementation: str | None,
+        platforms: list[str] | None,
+    ) -> None: ...
+    @property
+    def supported_tags(self) -> list[Tag]: ...

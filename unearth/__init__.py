@@ -1,3 +1,3 @@
-from ._core import Link
+from ._core import Link, Tag, TargetPython
 
-__all__ = ["Link"]
+__all__ = ["Link", "TargetPython", "Tag"]
