@@ -1,10 +1,11 @@
-use std::fmt;
-
+use pep440_rs::Version;
+use pep_427::wheel_name;
 #[cfg(feature = "pyo3")]
 use pyo3::{exceptions::PyNotImplementedError, prelude::*, pyclass::CompareOp, types::PyIterator};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, FromPyObject)]
-pub struct PythonVersion(u16, u16);
+use std::fmt;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "pyo3", derive(FromPyObject))]
+pub struct PythonVersion(usize, usize);
 
 #[cfg(feature = "pyo3")]
 impl IntoPy<PyObject> for PythonVersion {
@@ -18,6 +19,13 @@ impl PythonVersion {
         format!("{}{}", self.0, self.1)
     }
 }
+
+impl From<PythonVersion> for Version {
+    fn from(version: PythonVersion) -> Self {
+        Self::from_release(vec![version.0, version.1])
+    }
+}
+
 #[cfg_attr(feature = "pyo3", pyclass(get_all))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Tag {
@@ -26,6 +34,7 @@ pub struct Tag {
     pub platform: String,
 }
 
+#[cfg(feature = "pyo3")]
 impl Tag {
     fn from_pkg_obj(obj: &PyAny) -> PyResult<Self> {
         let interpreter = obj.getattr("interpreter")?.extract()?;
@@ -43,6 +52,16 @@ impl Tag {
 impl fmt::Display for Tag {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}-{}-{}", self.interpreter, self.abi, self.platform)
+    }
+}
+
+impl From<&wheel_name::Tag> for Tag {
+    fn from(value: &wheel_name::Tag) -> Self {
+        Self {
+            interpreter: value.python.to_owned(),
+            abi: value.abi.to_owned(),
+            platform: value.platform.to_owned(),
+        }
     }
 }
 
@@ -80,12 +99,16 @@ impl Tag {
 #[cfg_attr(feature = "pyo3", pyclass(get_all))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TargetPython {
+    pub py_ver: PythonVersion,
     pub supported_tags: Vec<Tag>,
 }
 
 impl TargetPython {
-    pub fn new(supported_tags: Vec<Tag>) -> Self {
-        Self { supported_tags }
+    pub fn is_compatible(&self, wheel: &wheel_name::WheelName) -> bool {
+        wheel
+            .tags
+            .iter()
+            .any(|t| self.supported_tags.contains(&t.into()))
     }
 }
 
@@ -95,14 +118,30 @@ impl TargetPython {
     #[new]
     #[pyo3(signature = (py_ver = None, abis = None, implementation = None, platforms = None))]
     fn py_new(
+        py: Python<'_>,
         py_ver: Option<PythonVersion>,
         abis: Option<Vec<String>>,
         implementation: Option<String>,
         platforms: Option<Vec<String>>,
     ) -> PyResult<Self> {
         let tags = py_impl::get_supported_tags(py_ver, abis, implementation, platforms)?;
-
-        Ok(Self::new(tags))
+        let py_ver = if py_ver.is_none() {
+            let platform = py.import("platform")?;
+            let python_version_tuple: (String, String, String) = platform
+                .getattr("python_version_tuple")?
+                .call0()?
+                .extract()?;
+            PythonVersion(
+                python_version_tuple.0.parse().unwrap(),
+                python_version_tuple.1.parse().unwrap(),
+            )
+        } else {
+            py_ver.unwrap()
+        };
+        Ok(Self {
+            py_ver,
+            supported_tags: tags,
+        })
     }
 }
 

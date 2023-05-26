@@ -5,8 +5,10 @@ use pyo3_log;
 
 pub mod error;
 pub mod evaluator;
+mod hash;
 pub mod link;
 pub mod py;
+pub mod session;
 pub mod source;
 
 pub use error::{Error, ErrorKind};

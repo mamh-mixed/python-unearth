@@ -1,4 +1,4 @@
-use once_cell::sync::Lazy;
+use lazy_static::lazy_static;
 #[cfg(feature = "pyo3")]
 use pyo3::{
     basic::CompareOp,
@@ -9,7 +9,6 @@ use pyo3::{
 use regex::Regex;
 use serde::Deserialize;
 use std::path::Path;
-#[cfg(feature = "pyo3")]
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
@@ -19,11 +18,12 @@ use url::Url;
 
 use crate::error::{Error, ErrorKind};
 
-static VCS_SCHEMES: [&str; 4] = ["git", "hg", "svn", "bzr"];
-#[cfg(feature = "pyo3")]
-static SUPPORTED_HASHES: [&str; 6] = ["sha1", "sha224", "sha384", "sha256", "sha512", "md5"];
-static SSH_GIT_URL: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(^.+?://(?:.+?@)?.+?)(:)(.+$)").unwrap());
+lazy_static! {
+    static ref VCS_SCHEMES: [&'static str; 4] = ["git", "hg", "svn", "bzr"];
+    static ref SUPPORTED_HASHES: [&'static str; 6] =
+        ["sha1", "sha224", "sha384", "sha256", "sha512", "md5"];
+    static ref SSH_GIT_URL: Regex = Regex::new(r"(^.+?://(?:.+?@)?.+?)(:)(.+$)").unwrap();
+}
 
 #[cfg_attr(feature = "pyo3", derive(FromPyObject))]
 #[derive(Clone, Debug, Deserialize)]
@@ -50,6 +50,7 @@ impl IntoPy<PyObject> for DistMetadata {
 }
 
 #[cfg_attr(feature = "pyo3", pyclass)]
+#[derive(Clone, Debug)]
 pub struct Link {
     url: String,
     pub normalized: String,
@@ -58,7 +59,7 @@ pub struct Link {
     pub comes_from: Option<String>,
     pub yank_reason: Option<String>,
     pub requires_python: Option<String>,
-    hashes_map: Option<HashMap<String, String>>,
+    pub hashes_map: Option<HashMap<String, String>>,
     pub dist_metadata: Option<DistMetadata>,
 }
 
@@ -151,6 +152,39 @@ impl Link {
         cloned.set_fragment(None);
         cloned.to_string()
     }
+
+    pub fn is_wheel(&self) -> bool {
+        self.filename().ends_with(".whl")
+    }
+
+    pub fn hashes(&self) -> Option<HashMap<String, String>> {
+        if let Some(hashes) = &self.hashes_map {
+            Some(hashes.clone())
+        } else {
+            let fragments = self.parsed.fragment()?;
+            let query = url::form_urlencoded::parse(fragments.as_bytes());
+            let hashes = query
+                .into_iter()
+                .filter(|(key, _)| SUPPORTED_HASHES.contains(&key.as_ref()))
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<HashMap<_, _>>();
+            if hashes.is_empty() {
+                None
+            } else {
+                Some(hashes)
+            }
+        }
+    }
+
+    pub fn egg(&self) -> Option<String> {
+        let fragments = self.parsed.fragment()?;
+        let query = url::form_urlencoded::parse(fragments.as_bytes());
+        let egg = query
+            .into_iter()
+            .find(|(key, _)| key == "egg")
+            .map(|(_, value)| value.to_string());
+        egg
+    }
 }
 
 impl FromStr for Link {
@@ -158,6 +192,14 @@ impl FromStr for Link {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::new(s.to_string(), None, None, None, None, None)
+    }
+}
+
+impl Hash for Link {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.normalized.hash(state);
+        self.requires_python.hash(state);
+        self.yank_reason.hash(state);
     }
 }
 
@@ -220,9 +262,7 @@ impl Link {
 
     fn __hash__(&self) -> u64 {
         let mut hasher = DefaultHasher::new();
-        self.normalized.hash(&mut hasher);
-        self.requires_python.hash(&mut hasher);
-        self.yank_reason.hash(&mut hasher);
+        self.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -311,6 +351,11 @@ impl Link {
         self.vcs.is_some()
     }
 
+    #[getter(is_wheel)]
+    fn py_is_wheel(&self) -> bool {
+        self.is_wheel()
+    }
+
     #[getter]
     fn is_yanked(&self) -> bool {
         self.yank_reason.is_some()
@@ -319,11 +364,6 @@ impl Link {
     #[getter(filename)]
     fn py_filename(&self) -> String {
         self.filename()
-    }
-
-    #[getter]
-    fn is_wheel(&self) -> bool {
-        self.filename().ends_with(".whl")
     }
 
     #[getter]
@@ -338,34 +378,9 @@ impl Link {
             .map(|(_, value)| value.to_string())
     }
 
-    #[getter]
-    fn hashes(&self) -> Option<HashMap<String, String>> {
-        if let Some(hashes) = &self.hashes_map {
-            Some(hashes.clone())
-        } else {
-            let fragments = self.parsed.fragment()?;
-            let query = url::form_urlencoded::parse(fragments.as_bytes());
-            let hashes = query
-                .into_iter()
-                .filter(|(key, _)| SUPPORTED_HASHES.contains(&key.as_ref()))
-                .map(|(key, value)| (key.to_string(), value.to_string()))
-                .collect::<HashMap<_, _>>();
-            if hashes.is_empty() {
-                None
-            } else {
-                Some(hashes)
-            }
-        }
-    }
-
-    #[getter]
-    fn hash_options(&self) -> Option<HashMap<String, Vec<String>>> {
-        self.hashes().map(|hashes| {
-            hashes
-                .into_iter()
-                .map(|(key, value)| (key, vec![value]))
-                .collect()
-        })
+    #[getter(hashes)]
+    fn py_hashes(&self) -> Option<HashMap<String, String>> {
+        self.hashes()
     }
 
     #[getter]

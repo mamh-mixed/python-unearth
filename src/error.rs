@@ -13,6 +13,8 @@ pub enum ErrorKind {
     HashError,
     IOError,
     CollectError,
+    ValueError,
+    LinkMismatchError,
 }
 
 #[derive(Debug)]
@@ -57,11 +59,10 @@ impl From<reqwest::Error> for Error {
 impl From<Error> for PyErr {
     fn from(error: Error) -> PyErr {
         match error.kind {
-            ErrorKind::UrlError => PyValueError::new_err(error.message),
             ErrorKind::UnpackError => PyOSError::new_err(error.message),
-            ErrorKind::HashError => PyValueError::new_err(error.message),
             ErrorKind::CollectError => PyOSError::new_err(error.message),
             ErrorKind::IOError => PyOSError::new_err(error.message),
+            _ => PyValueError::new_err(error.message),
         }
     }
 }

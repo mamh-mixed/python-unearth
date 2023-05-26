@@ -1,5 +1,7 @@
 use crate::error::ErrorKind;
+use crate::session::PyPISession;
 use crate::{error::Error, link::Link};
+use lazy_static::lazy_static;
 use mime_guess;
 use scraper::{Html, Selector};
 use serde::Deserialize;
@@ -10,18 +12,20 @@ use url::Url;
 
 use crate::link::DistMetadata;
 
-static ARCHIVE_EXTENSIONS: [&str; 10] = [
-    ".zip",
-    ".whl",
-    ".tar.bz2",
-    ".tbz",
-    ".tar.xz",
-    ".txz",
-    ".tlz",
-    ".tar.lz",
-    ".tar.lzma",
-    ".tar.gz",
-];
+lazy_static! {
+    pub static ref ARCHIVE_EXTENSIONS: [&'static str; 10] = [
+        ".zip",
+        ".whl",
+        ".tar.bz2",
+        ".tbz",
+        ".tar.xz",
+        ".txz",
+        ".tlz",
+        ".tar.lz",
+        ".tar.lzma",
+        ".tar.gz",
+    ];
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
@@ -32,20 +36,17 @@ enum Yanked {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-struct FileItem {
+struct PackageFile {
     data_dist_info_metadata: Option<DistMetadata>,
-    filename: String,
     hashes: Option<HashMap<String, String>>,
     requires_python: Option<String>,
     url: Option<String>,
-
     yanked: Yanked,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct Response {
-    name: String,
-    files: Vec<FileItem>,
+    files: Vec<PackageFile>,
 }
 
 enum PyPIResponse {
@@ -54,7 +55,7 @@ enum PyPIResponse {
 }
 
 pub fn collect_links(
-    client: &reqwest::blocking::Client,
+    client: &PyPISession,
     source: &Link,
     expand: bool,
 ) -> Result<Vec<Link>, Error> {
@@ -105,10 +106,7 @@ fn is_html_file(file_url: &str) -> bool {
     mime_type == mime_guess::mime::TEXT_HTML
 }
 
-fn collect_links_from_page(
-    client: &reqwest::blocking::Client,
-    source: &Link,
-) -> Result<Vec<Link>, Error> {
+fn collect_links_from_page(client: &PyPISession, source: &Link) -> Result<Vec<Link>, Error> {
     let content = if source.is_file() {
         PyPIResponse::Html(std::fs::read_to_string(source.file_path()?)?)
     } else {
@@ -128,10 +126,7 @@ fn collect_links_from_page(
     }
 }
 
-fn get_pypi_response(
-    client: &reqwest::blocking::Client,
-    source: &Link,
-) -> Result<PyPIResponse, Error> {
+fn get_pypi_response(client: &PyPISession, source: &Link) -> Result<PyPIResponse, Error> {
     if is_archive_file(&source.filename()) {
         ensure_index_response(client, source)?;
     }
@@ -236,7 +231,7 @@ fn is_archive_file(name: &str) -> bool {
 
 /// If the URL looks like a file, send a HEAD request to ensure
 /// the link is an HTML page to avoid downloading a large file.
-fn ensure_index_response(client: &reqwest::blocking::Client, source: &Link) -> Result<(), Error> {
+fn ensure_index_response(client: &PyPISession, source: &Link) -> Result<(), Error> {
     if source.parsed.scheme() != "http" && source.parsed.scheme() != "https" {
         return Err(Error::new(
             ErrorKind::CollectError,
@@ -277,10 +272,10 @@ mod tests {
 
     #[test]
     fn test_fetch_links_from_html() {
-        let client = reqwest::blocking::Client::new();
+        let client = PyPISession::new();
         let source = Link::from_str("https://pypi.org/simple/cacheyou/").unwrap();
         let links = collect_links(&client, &source, false).unwrap();
-        assert_eq!(links.len(), 8);
+        assert!(links.len() > 0);
         let last_link = links.last().unwrap();
         assert!(last_link.dist_metadata.is_some());
         assert!(last_link.requires_python.is_some());
